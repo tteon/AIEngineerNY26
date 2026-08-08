@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextvars
 import dataclasses
 import datetime
 import json
@@ -522,13 +523,48 @@ def score(question: Dict[str, Any], gold_rows: List[Dict[str, Any]],
 # --------------------------------------------------------------------------------------
 # Episodes
 # --------------------------------------------------------------------------------------
+# Per-episode recorder for LLM-call telemetry. MARA (SambaNova-hosted) extends usage with
+# reasoning_tokens, time_to_first_token and decode throughput; the openai SDK keeps them
+# as pydantic extras but the agents SDK's aggregate drops them. Each episode sets a fresh
+# list here; the wrapped client appends one row per chat call (contextvars keep episodes
+# apart under asyncio concurrency).
+_LLM_CALLS: contextvars.ContextVar = contextvars.ContextVar("llm_calls")
+
+
+def _instrument(client):
+    orig = client.chat.completions.create
+
+    async def create(*args, **kwargs):
+        r = await orig(*args, **kwargs)
+        rows = _LLM_CALLS.get(None)
+        u = getattr(r, "usage", None)
+        if rows is not None and u is not None:
+            try:
+                d = u.model_dump()
+            except Exception:
+                d = {}
+            rows.append({
+                "prompt_tokens": d.get("prompt_tokens"),
+                "completion_tokens": d.get("completion_tokens"),
+                "reasoning_tokens": (d.get("completion_tokens_details") or {}).get("reasoning_tokens"),
+                "cached_tokens": (d.get("prompt_tokens_details") or {}).get("cached_tokens"),
+                "ttft_s": d.get("time_to_first_token"),
+                "decode_tps": d.get("completion_tokens_per_sec"),
+            })
+        return r
+
+    client.chat.completions.create = create
+    return client
+
+
 def mara_model(model: str):
     from agents import OpenAIChatCompletionsModel
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI(api_key=os.environ["MARA_API_KEY"],
-                         base_url=os.getenv("MARA_BASE_URL",
-                                            "https://api.cloud.mara.com/v1"))
+    client = _instrument(
+        AsyncOpenAI(api_key=os.environ["MARA_API_KEY"],
+                    base_url=os.getenv("MARA_BASE_URL",
+                                       "https://api.cloud.mara.com/v1")))
     return OpenAIChatCompletionsModel(model=model, openai_client=client)
 
 
@@ -540,6 +576,7 @@ async def run_episode(*, driver, database: str, sf: int, stack: Stack,
                       row_cap: int = DEFAULT_ROW_CAP, regime: str = "agg",
                       max_turns: int = MAX_TURNS) -> Dict[str, Any]:
     calls: List[Dict[str, Any]] = []
+    llm_token = _LLM_CALLS.set([])
     tool = make_tool(driver, database, stack=stack, anchor=anchor, calls=calls,
                      guardrail_fn=guardrail_fn if stack.enforcement == "guardrail" else None,
                      encode_rows=encode_rows, metrics=metrics, row_cap=row_cap,
@@ -582,6 +619,8 @@ async def run_episode(*, driver, database: str, sf: int, stack: Stack,
     except Exception as exc:
         err = f"{type(exc).__name__}: {str(exc)[:200]}"
     wall_ms = (time.perf_counter() - t0) * 1000
+    llm_calls = _LLM_CALLS.get()
+    _LLM_CALLS.reset(llm_token)
 
     answer, parse_note = parse_answer(final_text)
     verdict = score(question, gold_rows, answer) if err is None else {
@@ -607,6 +646,11 @@ async def run_episode(*, driver, database: str, sf: int, stack: Stack,
         "model_ms": round(max(wall_ms - db_ms, 0.0), 1),
         "wall_ms": round(wall_ms, 1),
         "input_tokens": usage_in, "output_tokens": usage_out,
+        "reasoning_tokens": sum(c["reasoning_tokens"] or 0 for c in llm_calls),
+        "ttft_p50_ms": (sorted(c["ttft_s"] for c in llm_calls if c["ttft_s"] is not None)
+                        [len([c for c in llm_calls if c["ttft_s"] is not None]) // 2] * 1000
+                        if any(c["ttft_s"] is not None for c in llm_calls) else None),
+        "llm_calls": llm_calls,
         "guardrail_rejections": sum(1 for c in calls
                                     if c["outcome"] == "guardrail_rejected"),
         "aggregate_rejections": sum(1 for c in calls
