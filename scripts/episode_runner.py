@@ -236,7 +236,8 @@ def labels_only_schema(ontology: Any) -> Dict[str, Any]:
     return {"nodes": nodes, "relationships": rels}
 
 
-def build_instructions(schema: Dict[str, Any], stack: Stack, row_cap: int) -> str:
+def build_instructions(schema: Dict[str, Any], stack: Stack, row_cap: int,
+                       regime: str = "agg") -> str:
     parts = [
         "You are a financial-crime analyst answering questions about a financial graph by "
         "writing Cypher and running it with the run_cypher tool.",
@@ -254,6 +255,11 @@ def build_instructions(schema: Dict[str, Any], stack: Stack, row_cap: int) -> st
         "- End every query with LIMIT $limit.",
         "- Call the tool as many times as you need, then answer.",
     ]
+    if regime == "rows":
+        parts.append(
+            "- You may NOT use aggregate functions in Cypher (count, sum, avg, min, max, "
+            "collect, percentile). Return the underlying rows and compute the answer "
+            "yourself from what you receive.")
     if stack.encoding == "csv":
         parts.append(
             f"- The tool returns rows as CSV: a header line, one line per row, and a final "
@@ -279,7 +285,7 @@ def build_instructions(schema: Dict[str, Any], stack: Stack, row_cap: int) -> st
 # --------------------------------------------------------------------------------------
 def make_tool(driver, database: str, *, stack: Stack, anchor: Optional[int],
               calls: List[Dict[str, Any]], guardrail_fn, encode_rows, metrics,
-              row_cap: int):
+              row_cap: int, regime: str = "agg"):
     @function_tool(
         name_override="run_cypher",
         description_override=(
@@ -295,6 +301,18 @@ def make_tool(driver, database: str, *, stack: Stack, anchor: Optional[int],
         if anchor is not None:
             params["a"] = anchor
             params["acct_no"] = anchor
+
+        if regime == "rows":
+            hit = _AGGREGATE_RE.search(cypher)
+            if hit:
+                record["outcome"] = "aggregate_rejected"
+                record["violations"] = [f"server_side_aggregate:{hit.group(1).lower()}"]
+                msg = (f"REJECTED — `{hit.group(1)}(` is an aggregate and this task requires "
+                       f"you to compute the answer from the rows yourself. Re-emit the query "
+                       f"so it returns the underlying rows, and page through them if there "
+                       f"are more than {row_cap}.")
+                record["chars"] = len(msg)
+                return msg
 
         if guardrail_fn is not None:
             violations = guardrail_fn(cypher, params)
@@ -378,6 +396,10 @@ def _db_hits(plan: Any) -> int:
 # Scoring — ported verbatim from AIsummit26 agent_interaction.py
 # --------------------------------------------------------------------------------------
 _ANSWER_RE = re.compile(r"ANSWER:\s*(.+)\s*$", re.S | re.I)
+# The rows regime moves the arithmetic out of the database and into the model; a query
+# that aggregates server-side defeats the measurement, so it is enforced, not requested.
+_AGGREGATE_RE = re.compile(
+    r"\b(count|sum|avg|min|max|collect|percentile\w*|stdev\w*)\s*\(", re.I)
 _DISCLOSURE_RE = re.compile(
     r"\b(truncat\w*|incomplete|partial(?:ly)?|not (?:all|every|complete)|only (?:the )?first"
     r"|more (?:rows|records|results) (?:are |were )?(?:available|exist)|capp?ed"
@@ -515,14 +537,16 @@ async def run_episode(*, driver, database: str, sf: int, stack: Stack,
                       gold_rows: List[Dict[str, Any]], schema: Dict[str, Any],
                       guardrail_fn, encode_rows, metrics, model_name: str,
                       repeat: int, max_tokens: Optional[int],
-                      row_cap: int = DEFAULT_ROW_CAP) -> Dict[str, Any]:
+                      row_cap: int = DEFAULT_ROW_CAP, regime: str = "agg",
+                      max_turns: int = MAX_TURNS) -> Dict[str, Any]:
     calls: List[Dict[str, Any]] = []
     tool = make_tool(driver, database, stack=stack, anchor=anchor, calls=calls,
                      guardrail_fn=guardrail_fn if stack.enforcement == "guardrail" else None,
-                     encode_rows=encode_rows, metrics=metrics, row_cap=row_cap)
+                     encode_rows=encode_rows, metrics=metrics, row_cap=row_cap,
+                     regime=regime)
     agent = Agent(
         name=f"analyst_{stack.name}",
-        instructions=build_instructions(schema, stack, row_cap),
+        instructions=build_instructions(schema, stack, row_cap, regime=regime),
         model=mara_model(model_name),
         model_settings=ModelSettings(temperature=0.0, max_tokens=max_tokens),
         tools=[tool],
@@ -533,7 +557,7 @@ async def run_episode(*, driver, database: str, sf: int, stack: Stack,
     usage_in = usage_out = 0
     nudged = False
     try:
-        result = await Runner.run(agent, prompt, max_turns=MAX_TURNS)
+        result = await Runner.run(agent, prompt, max_turns=max_turns)
         final_text = str(result.final_output or "")
         usage = getattr(getattr(result, "context_wrapper", None), "usage", None)
         if usage is not None:
@@ -572,6 +596,7 @@ async def run_episode(*, driver, database: str, sf: int, stack: Stack,
         "sf": sf, "database": database, "stack": stack.name,
         "stack_config": stack.describe(),
         "question_id": question["id"], "repeat": repeat, "row_cap": row_cap,
+        "regime": regime, "max_turns": max_turns,
         "audience": question["audience"], "difficulty": question["difficulty"],
         "anchor": anchor,
         "round_trips": len(calls),
@@ -584,6 +609,8 @@ async def run_episode(*, driver, database: str, sf: int, stack: Stack,
         "input_tokens": usage_in, "output_tokens": usage_out,
         "guardrail_rejections": sum(1 for c in calls
                                     if c["outcome"] == "guardrail_rejected"),
+        "aggregate_rejections": sum(1 for c in calls
+                                    if c["outcome"] == "aggregate_rejected"),
         "db_errors": sum(1 for c in calls if c["outcome"] in ("db_error", "syntax_error")),
         "timeouts": sum(1 for c in calls if c["outcome"] == "timeout"),
         "violations": [v for c in calls for v in (c.get("violations") or [])],
@@ -617,7 +644,13 @@ async def main_async(args) -> None:
     schemas = {"ontology": schema_for_prompt(ontology, policy),
                "labels": labels_only_schema(ontology)}
 
+    if args.regime == "rows":
+        # The rows regime needs the AIsummit26 feasibility ladder (SF1 pageable in 4 pages,
+        # SF100 not), so the cap is 200 — set by amending the contract, not bypassing it:
+        # the guardrail validates against the same policy the harness pages with.
+        policy = dataclasses.replace(policy, max_result_rows=200)
     row_cap = policy.max_result_rows  # one number, owned by the contract
+    max_turns = 16 if args.regime == "rows" else MAX_TURNS
 
     def guardrail_fn(cypher: str, params: Dict[str, Any]) -> List[str]:
         return list(validate_text2cypher_fallback(cypher, params=params, policy=policy))
@@ -673,7 +706,7 @@ async def main_async(args) -> None:
                 gold_rows=ctx["gold"][q["id"]], schema=schemas[stack.schema],
                 guardrail_fn=guardrail_fn, encode_rows=encode_rows, metrics=metrics,
                 model_name=args.model, repeat=rep, max_tokens=args.max_tokens,
-                row_cap=row_cap)
+                row_cap=row_cap, regime=args.regime, max_turns=max_turns)
         results.append(r)
         print(f"  {db:12s} {stack.name:10s} {q['id']:11s} r{rep} "
               f"trips={r['round_trips']} ok={r['score_correct']} "
@@ -689,7 +722,8 @@ async def main_async(args) -> None:
     out = {
         "schema_version": "aiengineerny26.before-after.v1",
         "manifest": manifest(model=args.model, stacks=[s.describe() for s in stacks],
-                             row_cap=row_cap, max_turns=MAX_TURNS, repeats=args.repeats,
+                             row_cap=row_cap, max_turns=max_turns, repeats=args.repeats,
+                             regime=args.regime, concurrency=args.concurrency,
                              purpose="before/after the agent<->KB interface engineering"),
         "questions": [{k: q[k] for k in ("id", "audience", "difficulty", "ko", "question",
                                          "shape")} for q in questions],
@@ -710,6 +744,8 @@ def main() -> None:
     p.add_argument("--encoding", choices=["json", "csv"])
     p.add_argument("--disclosure", action="store_true", default=None)
     p.add_argument("--enforcement", choices=["none", "guardrail"])
+    p.add_argument("--regime", choices=["agg", "rows"], default="agg",
+                   help="rows: aggregates banned, answer computed from paged rows")
     p.add_argument("--model", default="gpt-oss-120b")
     p.add_argument("--max-tokens", type=int, default=None)
     p.add_argument("--repeats", type=int, default=1)
