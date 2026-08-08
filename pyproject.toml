@@ -7,6 +7,7 @@ dependencies = [
     "seocho[otel]",
     "neo4j>=6",
     "pyyaml",
+    "openai-agents>=0.19.4",
 ]
 
 [tool.uv.sources]
