@@ -8,6 +8,8 @@ dependencies = [
     "neo4j>=6",
     "pyyaml",
     "openai-agents>=0.19.4",
+    "sambanova>=1.12.1",
+    "matplotlib>=3.11.1",
 ]
 
 [tool.uv.sources]
