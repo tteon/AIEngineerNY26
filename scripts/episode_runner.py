@@ -73,7 +73,7 @@ PRESETS = {
 
 
 # --------------------------------------------------------------------------------------
-# Questions: one per difficulty, verbatim from AIsummit26 (gold ref included)
+# Questions: the full AIsummit26 set, verbatim (gold ref included)
 # --------------------------------------------------------------------------------------
 QUESTIONS: List[Dict[str, Any]] = [
     {
@@ -86,6 +86,87 @@ QUESTIONS: List[Dict[str, Any]] = [
                 "(:Account {_workspace_id:$ws}) RETURN count(t) AS n, sum(t.amount) AS total"),
     },
     {
+        "id": "ext_easy_2", "audience": "external", "difficulty": "easy",
+        "ko": "내 계좌에서 나간 이체 건수와 그 중 가장 큰 금액은?",
+        "question": ("For account number {a}: how many outgoing transfers are there, and what "
+                     "is the single largest amount sent?"),
+        "shape": "scalar", "keys": ["n", "biggest"],
+        "ref": ("MATCH (:Account {acct_no:$a,_workspace_id:$ws})-[t:TRANSFER]->"
+                "(:Account {_workspace_id:$ws}) RETURN count(t) AS n, max(t.amount) AS biggest"),
+    },
+    {
+        "id": "ext_med_1", "audience": "external", "difficulty": "medium",
+        "ko": "내 계좌로 돈을 보낸 계좌 중 고위험 채널을 쓴 곳은 어디인가요?",
+        "question": ("Which accounts sent money to account number {a} on a transfer whose own "
+                     "channel_risk property is 5 or more? Give the five lowest such account "
+                     "numbers in ascending order."),
+        "shape": "list", "column": "acct",
+        "ref": ("MATCH (s:Account {_workspace_id:$ws})-[t:TRANSFER]->"
+                "(:Account {acct_no:$a,_workspace_id:$ws}) WHERE t.channel_risk>=5 "
+                "RETURN DISTINCT s.acct_no AS acct ORDER BY acct LIMIT 5"),
+    },
+    {
+        "id": "ext_med_2", "audience": "external", "difficulty": "medium",
+        "ko": "내가 송금한 계좌들의 실제 소유자는 누구인가요?",
+        "question": ("Who owns the accounts that account number {a} has sent money to? Give the "
+                     "five lowest owner ids in ascending order."),
+        "shape": "list", "column": "owner",
+        "ref": ("MATCH (:Account {acct_no:$a,_workspace_id:$ws})-[:TRANSFER]->"
+                "(b:Account {_workspace_id:$ws})<-[:OWN]-(o) "
+                "RETURN DISTINCT o.id AS owner ORDER BY owner LIMIT 5"),
+    },
+    {
+        "id": "ext_hard_1", "audience": "external", "difficulty": "hard",
+        "ko": "내 돈이 두 단계 안에 닿는 계좌는 몇 개이고, 그 중 가장 위험한 등급은?",
+        "question": ("Starting from account number {a} and following transfers downstream, how "
+                     "many distinct accounts are reachable within two hops, and what is the "
+                     "highest risk_tier among them?"),
+        "shape": "scalar", "keys": ["n", "worst_risk_tier"],
+        "ref": ("MATCH (:Account {acct_no:$a,_workspace_id:$ws})-[:TRANSFER*1..2]->"
+                "(b:Account {_workspace_id:$ws}) "
+                "RETURN count(DISTINCT b) AS n, max(b.risk_tier) AS worst_risk_tier"),
+    },
+    {
+        "id": "ext_hard_2", "audience": "external", "difficulty": "hard",
+        "ko": "내 계좌로 두 단계 안에 돈이 흘러들어온 계좌는 몇 개인가요?",
+        "question": ("How many distinct accounts sit within two transfer hops upstream of "
+                     "account number {a} — that is, accounts from which money reaches {a} in one "
+                     "or two transfers?"),
+        "shape": "scalar", "keys": ["n"],
+        "ref": ("MATCH (b:Account {_workspace_id:$ws})-[:TRANSFER*1..2]->"
+                "(:Account {acct_no:$a,_workspace_id:$ws}) RETURN count(DISTINCT b) AS n"),
+    },
+    {
+        "id": "int_easy_1", "audience": "internal", "difficulty": "easy",
+        "ko": "전체 계좌 수와 최고위험(등급 5) 계좌 수는?",
+        "question": ("How many accounts are there in total, and how many of them are at "
+                     "risk_tier 5?"),
+        "shape": "scalar", "keys": ["accounts", "tier5"],
+        "ref": ("MATCH (a:Account {_workspace_id:$ws}) RETURN count(a) AS accounts, "
+                "sum(CASE WHEN a.risk_tier=5 THEN 1 ELSE 0 END) AS tier5"),
+    },
+    {
+        "id": "int_easy_2", "audience": "internal", "difficulty": "easy",
+        "ko": "거래가 가장 많이 오간 채널 상위 5개는?",
+        "question": ("Which five channels carry the most transactions? Give the channel codes "
+                     "in descending order of total transaction count."),
+        "shape": "list", "column": "code",
+        "ref": ("MATCH (a:Account {_workspace_id:$ws})-[u:USES_CHANNEL]->"
+                "(c:Channel {_workspace_id:$ws}) RETURN c.code AS code, sum(u.tx_count) AS n "
+                "ORDER BY n DESC, code LIMIT 5"),
+    },
+    {
+        "id": "int_med_1", "audience": "internal", "difficulty": "medium",
+        "ko": "같은 사람이 소유한 계좌끼리 직접 송금이 오간 사례는 몇 건인가요?",
+        "question": ("How many distinct ordered pairs of two *different* accounts owned by the "
+                     "same party have a direct transfer running from the first to the second? "
+                     "Count each pair once however many transfers run between them."),
+        "shape": "scalar", "keys": ["n"],
+        "ref": ("MATCH (o {_workspace_id:$ws})-[:OWN]->(a:Account {_workspace_id:$ws})"
+                "-[:TRANSFER]->(b:Account {_workspace_id:$ws})<-[:OWN]-(o) WHERE a<>b "
+                "RETURN count(DISTINCT [a.acct_no,b.acct_no]) AS n"),
+    },
+    {
         "id": "int_med_2", "audience": "internal", "difficulty": "medium",
         "ko": "100곳이 넘는 상대로부터 입금을 받은 계좌는 어디인가요?",
         "question": ("Which accounts received transfers from more than 100 distinct sending "
@@ -94,6 +175,40 @@ QUESTIONS: List[Dict[str, Any]] = [
         "ref": ("MATCH (s:Account {_workspace_id:$ws})-[:TRANSFER]->"
                 "(t:Account {_workspace_id:$ws}) WITH t, count(DISTINCT s) AS fan "
                 "WHERE fan>100 RETURN t.acct_no AS acct ORDER BY acct LIMIT 5"),
+    },
+    {
+        "id": "int_hard_1", "audience": "internal", "difficulty": "hard",
+        "ko": "서로 돈이 오가고, 소유자끼리 보증을 서줬고, 같은 기기로 로그인한 계좌 쌍을 찾아주세요.",
+        "question": ("Find pairs of accounts that satisfy all three of these at once: money has "
+                     "moved between them by transfer, their owners are different parties who "
+                     "guarantee one another, and the same login device has signed in to both. "
+                     "Give the account number pairs, smaller number first."),
+        "shape": "list", "column": "a1",
+        "ref": ("MATCH (a:Account {_workspace_id:$ws})-[:TRANSFER]-(b:Account {_workspace_id:$ws}) "
+                "WHERE a.acct_no < b.acct_no "
+                "MATCH (pa {_workspace_id:$ws})-[:OWN]->(a), (pb {_workspace_id:$ws})-[:OWN]->(b) "
+                "WHERE pa<>pb AND (pa)-[:GUARANTEE]-(pb) "
+                "MATCH (m:Medium {_workspace_id:$ws})-[:SIGN_IN]->(a), (m)-[:SIGN_IN]->(b) "
+                "RETURN DISTINCT a.acct_no AS a1, b.acct_no AS a2 ORDER BY a1,a2 LIMIT 5"),
+    },
+    {
+        # int_hard_1 with the reciprocal/mutual ambiguity removed — kept as a pair, because a
+        # schema that makes direction legible does not remove ambiguity from a question, it
+        # exposes it (see AIsummit26).
+        "id": "int_hard_1b", "audience": "internal", "difficulty": "hard",
+        "ko": "서로 돈이 오가고, 소유자 중 한 쪽이 다른 쪽에 보증을 섰고, 같은 기기로 로그인한 계좌 쌍은?",
+        "question": ("Find pairs of accounts that satisfy all three of these at once: money has "
+                     "moved between them by transfer in either direction, their owners are two "
+                     "different parties and one of them guarantees the other in either "
+                     "direction, and the same login device has signed in to both. Give the "
+                     "account number pairs, smaller number first."),
+        "shape": "list", "column": "a1",
+        "ref": ("MATCH (a:Account {_workspace_id:$ws})-[:TRANSFER]-(b:Account {_workspace_id:$ws}) "
+                "WHERE a.acct_no < b.acct_no "
+                "MATCH (pa {_workspace_id:$ws})-[:OWN]->(a), (pb {_workspace_id:$ws})-[:OWN]->(b) "
+                "WHERE pa<>pb AND (pa)-[:GUARANTEE]-(pb) "
+                "MATCH (m:Medium {_workspace_id:$ws})-[:SIGN_IN]->(a), (m)-[:SIGN_IN]->(b) "
+                "RETURN DISTINCT a.acct_no AS a1, b.acct_no AS a2 ORDER BY a1,a2 LIMIT 5"),
     },
     {
         "id": "int_hard_2", "audience": "internal", "difficulty": "hard",
