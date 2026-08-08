@@ -1,0 +1,13 @@
+[project]
+name = "aiengineerny26"
+version = "0.0.1"
+description = "Multi-agent scalability and context interchange, measured on the SEOCHO stack"
+requires-python = ">=3.11"
+dependencies = [
+    "seocho[otel]",
+    "neo4j>=6",
+    "pyyaml",
+]
+
+[tool.uv.sources]
+seocho = { path = "vendor/seocho", editable = true }

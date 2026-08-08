@@ -1,0 +1,3 @@
+[submodule "vendor/seocho"]
+	path = vendor/seocho
+	url = https://github.com/tteon/seocho.git
